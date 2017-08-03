@@ -1,0 +1,633 @@
+#!/usr/bin/env python
+import os
+import sys
+import re
+import paramiko
+import pexpect
+import ConfigParser
+import StringIO
+import multiprocessing as mp
+import getpass
+
+################################################################################################
+# Usage
+################################################################################################
+def Usage():
+    print "   usage:   " + sys.argv[0] + " -update_cache || -alias < Alias Name/Prefix >"
+    print ""
+    print "   -alias              : Alias Lookup"
+    print "   -wwn                : WWN Alias Lookup"
+    print "   -zone               : Zone Lookup"
+    print "   -zoneset_info       : Active Zoneset Name Lookup for VSAN"
+    print "   -switch_port        : Switch Port Flogi Lookup"
+    print "   -update_cache       : Update Cache Files"
+    print ""
+    print "   Example #1 :   " + sys.argv[0] + " -alias coreA                       (Alias Lookup)"
+    print "   Example #2 :   " + sys.argv[0] + " -wwn ffffffffffffffff              (WWN Lookup)"
+    print "   Example #3 :   " + sys.argv[0] + " -zone servername                   (Zone Lookup)"
+    print "   Example #4 :   " + sys.argv[0] + " -zoneset_info coreA 1001           (Active Zoneset Name Lookup for VSAN)"
+    print "   Example #5 :   " + sys.argv[0] + " -switch_port storage-edge1 fc2/5   (Switch Port Flogi Lookup)"
+    print "   Example #6 :   " + sys.argv[0] + " -update_cache                      (Updates Cache Files Only)"
+    sys.exit(2)
+
+
+
+################################################################################################
+# Checking Command Line Option
+################################################################################################
+def Check_CLI_Syntax():
+    if len(sys.argv) < 2:
+        Usage()
+    
+    global UPDATE_CACHE
+    global ALIAS
+    global WWN
+    global ZONESET_INFO
+    global ZONE
+    global SWITCH_PORT
+
+    UPDATE_CACHE = False
+    ALIAS = False
+    WWN = False
+    ZONESET_INFO = False
+    ZONE = False
+    SWITCH_PORT = False
+
+
+    if "-update_cache" in sys.argv[1]:
+        UPDATE_CACHE = True
+    elif "-alias" in sys.argv[1]:
+        if len(sys.argv) == 3:
+            ALIAS = True 
+            global Alias_Search
+            Alias_Search = sys.argv[2]
+        else:
+            Usage()
+    elif "-wwn" in sys.argv[1]:
+        if len(sys.argv) == 3:
+            WWN = True 
+            global WWN_Search
+            WWN_Search = sys.argv[2]
+        else:
+            Usage()
+    elif "-zoneset_info" in sys.argv[1]:
+        if len(sys.argv) == 4:
+            ZONESET_INFO = True
+            global SwitchName
+            global VSANNumber
+            SwitchName = sys.argv[2]
+            VSANNumber = sys.argv[3]
+        else:
+            Usage()
+    elif "-zone" in sys.argv[1]:
+        if len(sys.argv) == 3:
+            ZONE = True
+            global Zone_Search
+            Zone_Search = sys.argv[2]
+        else:
+            Usage()
+    elif "-switch_port" in sys.argv[1]:
+        if len(sys.argv) == 4:
+            SWITCH_PORT = True
+            global Switch_Name
+            global Port_Info
+            Switch_Name = sys.argv[2]
+            Port_Info = sys.argv[3]
+        else:
+            Usage()
+    elif "-help" in sys.argv[1]:
+        Usage() 
+    else:
+        Usage()
+
+
+################################################################################################
+# Looking at configuration file and importing the configuration settings.
+################################################################################################
+def Import_Config_File():
+    Config = ConfigParser.ConfigParser()
+    Config.read(CFG_File)
+    SWITCHES = Config.get("Fabric_Config", "SWITCH")
+    SWITCHES = SWITCHES.split(",")
+    SW_USER = Config.get("Fabric_Config", "SW_USER")
+    SW_PASSWORD = Config.get("Fabric_Config", "SW_PASSWORD")
+    return (SWITCHES,SW_USER,SW_PASSWORD)
+
+
+################################################################################################
+# Generating MDS module number and interface information from port wwpn.
+################################################################################################
+def Get_MDS_Mod_Int_From_WWN(switch_pwwn):
+    pwwn_extract = str.replace(switch_pwwn[1:5], ":", "")
+    interface = int(pwwn_extract, 16) % 64
+    mod = (int(pwwn_extract, 16) / 64) + 1
+    t_int = "fc" + str(mod) + "/" + str(interface)
+    return(t_int)
+
+    
+################################################################################################
+# Generating MDS switch name for WWPN to switch name mapping.
+################################################################################################
+def Get_MDS_SwitchName_From_WWN(sh_switch_wwn, List ):
+    temp_list = set(List)
+    rec_found = 0
+    for rec in temp_list:
+        if sh_switch_wwn in rec:
+            rec_found = 1
+            j1, switch_name = rec.split()
+            return(switch_name)
+    if rec_found == 0:
+        switch_name = "20:00:" + sh_switch_wwn
+        return(switch_name)
+            
+################################################################################################
+# Collect Data
+################################################################################################
+def Collect_Data(switch, SW_USER, SW_PASSWORD):
+    verbose = False
+    SSH_NEWKEY = r'Are you sure you want to continue connecting \(yes/no\)\?'
+    try:
+      try:
+        child = pexpect.spawn('ssh %s@%s' % (SW_USER, switch))
+        if verbose:
+            child.logfile = sys.stdout
+        child.timeout = 45
+        i = child.expect([pexpect.TIMEOUT, SSH_NEWKEY, '[Pp]assword:'])
+        if i == 0:
+            print "Error: Couldn't log on to the switch " + switch
+            sys.exit(1)
+        if i == 1:
+            child.sendline('yes')
+            child.expect('[Pp]assword:')
+            child.sendline(SW_PASSWORD)
+            a = child.expect([pexpect.TIMEOUT, '[Pp]assword:', '#'])
+            if a == 0:
+                print "Error: Couldn't log on to the switch " + switch
+                sys.exit(1)
+            if a == 1:
+                print "Error: Wrong password provided for " + switch + ". Please run CNTL C"
+                sys.exit(1)
+        if i == 2:
+            child.sendline(SW_PASSWORD)
+            a = child.expect([pexpect.TIMEOUT, '[Pp]assword:', '#'])
+            if a == 0:
+                print "Error: Couldn't log on to the switch " + switch
+                sys.exit(1)
+            if a == 1:
+                print "Error: Wrong password provided for " + switch + ". Please run CNTL C"
+                sys.exit(1)
+       
+      except pexpect.TIMEOUT:
+          raise OurException("Couldn't log on to the switch")
+      child.sendline('terminal length 0')
+      child.expect('#')
+      child.sendline('show fcns database detail')
+      child.expect('#')
+      fcns_db = child.before
+      child.sendline('show zoneset active')
+      child.expect('#')
+      zoneset_db = child.before
+      child.sendline('show fcs ie')
+      child.expect('#')
+      fcs_ie_db = child.before
+      child.sendline('exit')
+    except (pexpect.EOF, pexpect.TIMEOUT), e:
+        print "Error: Running remaining commands."
+        raise
+    t_list = [fcns_db, zoneset_db, fcs_ie_db]
+#    return(fcns_db, zoneset_db, fcs_ie_db)
+    return(t_list)    
+
+################################################################################################
+# Worker (For MultiProcessing
+################################################################################################
+def Worker(switch, username, password, out_q):
+    outdict = {}
+    outdict[switch] = Collect_Data(switch, username, password)
+    out_q.put(outdict)
+
+################################################################################################
+# MP_Func (For MultiProcessing
+################################################################################################
+def MP_Func(SWITCHES, SW_USER, SW_PASSWORD):
+     out_q = mp.Queue()
+     procs = []
+     for switch in SWITCHES:
+         p = mp.Process(target = Worker, args=(switch, SW_USER, SW_PASSWORD, out_q))
+         procs.append(p)
+         p.start()
+   
+     resultdict = {}
+     for switch in SWITCHES:
+         resultdict.update(out_q.get())
+
+     for p in procs:
+         p.join()
+
+     return resultdict
+
+
+################################################################################################
+# Updating Cache
+################################################################################################
+def Update_Cache(SWITCHES, SW_USER, SW_PASSWORD):
+    if SW_USER == "":
+        T_Sw = ', ' .join(SWITCHES)
+        #print "Enter Username for " + T_Sw + ":\t",
+        print "Enter Username for " + T_Sw + ":",
+        SW_USER = sys.stdin.readline()
+        SW_USER = SW_USER.replace( '\r', '')
+        SW_USER = SW_USER.replace( '\n', '')
+        SW_USER = SW_USER.replace( ' ', '')
+    
+    if SW_PASSWORD == "":
+        SW_PASSWORD = getpass.getpass(prompt='Enter Password for MDS Switches:')
+    # Overwriting some files.   
+    temp_sw_wwn_file = CACHE_DIR + "/switch_wwn.txt"
+    Temp_Sw_WWN_File = open(temp_sw_wwn_file, 'w+')
+    Temp_Sw_WWN_File.close()
+
+    fab_flogi_db_file = CACHE_DIR + "/fab_flogi_devalias_info.txt"
+    FAB_Flogi_DB_File = open(fab_flogi_db_file, 'w+')
+    FAB_Flogi_DB_File.close()
+    info = MP_Func(SWITCHES, SW_USER, SW_PASSWORD)  
+
+    for switch in SWITCHES:
+        # Opening some files in overwrite or append mode.
+        Temp_Sw_WWN_File = open(temp_sw_wwn_file, 'a')
+        fcns_db_file = CACHE_DIR + "/" + switch + "_fcns_database.txt"
+        FCNS_DB_File = open(fcns_db_file, 'w+')
+
+        sw_zoneset_file = CACHE_DIR + "/" + switch + "_zoneset.txt"
+        Sw_ZoneSet_File = open(sw_zoneset_file, 'w+')
+
+        # Opening SSH Connection and appending CLI output to files.
+#        fcns_db, sw_zoneset, temp_sw_wwn = Collect_Data(switch, SW_USER, SW_PASSWORD)
+        fcns_db = info[switch][0]
+        sw_zoneset = info[switch][1]
+        temp_sw_wwn = info[switch][2]
+
+        FCNS_DB_File.write(fcns_db)
+        FCNS_DB_File.write("\nVSAN: junk\n")
+
+        Sw_ZoneSet_File.write(sw_zoneset)
+        Sw_ZoneSet_File.write("\n  zone name JUNK vsan WXYZ\n")
+
+        Temp_Sw_WWN_File.write(temp_sw_wwn)
+
+        print "Collected information from " + switch
+
+        Temp_Sw_WWN_File.close()
+        FCNS_DB_File.close()
+        Sw_ZoneSet_File.close()
+
+    # Parsing switch wwn and associated switch name
+    Temp_Sw_WWN_File = open(temp_sw_wwn_file, 'r')
+    with open(temp_sw_wwn_file, 'r') as Temp_Sw_WWN_File:
+        content = Temp_Sw_WWN_File.read()
+        List = []
+        for line in StringIO.StringIO(content):
+            if re.match("..:..:..:..:..:..:..:..", line, re.I) is not None:
+                line = line.replace('\r',"")
+                line = line.replace("\n","")
+                t_rec_line = line.split()
+                if len(t_rec_line) == 5:
+                    temp_wwn, j2, j3, j4, temp_sw_name = line.split()
+                elif len(t_rec_line) == 4:
+                    temp_wwn, j2, j3, temp_sw_name = line.split()
+                temp_sw_name = temp_sw_name.replace("(", "")
+                temp_sw_name = temp_sw_name.replace(")", "")
+                temp_wwn = re.sub("^..:..", "20:00", temp_wwn)
+                last_char = temp_wwn[-1:]
+                last_char = int(last_char) - 1
+                last_char = str(last_char)
+                temp_wwn = re.sub(".$", last_char, temp_wwn)
+                temp_rec = temp_wwn + " " + temp_sw_name
+                List.append(temp_rec)
+        List = set(List)
+        List = list(List)
+        List.sort()
+    new_sw_wwn = CACHE_DIR + "/switchwwn.txt"
+    new_sw_wwn_file = open(new_sw_wwn, "w+") 
+    for rec in List:
+        new_sw_wwn_file.write(rec + "\n")
+
+    # Parsing FCNS DB and creating flogi database mapping.
+
+    fab_flogi_db_file = CACHE_DIR + "/fab_flogi_devalias_info.txt"
+    FAB_Flogi_DB_File = open(fab_flogi_db_file, 'a+')
+    s = " "
+    for switch in SWITCHES:
+        fcns_db_file = CACHE_DIR + "/" + switch + "_fcns_database.txt"
+        with open(fcns_db_file, 'r') as FCNS_DB_File:
+            content = FCNS_DB_File.read()
+            switch_info = int()
+            alias_trg = int()
+            fab_start = int()
+            for line in StringIO.StringIO(content):
+                line = line.replace('\r',"")
+                line = line.replace("\n", "")
+                if re.match("^VSAN:", line) is not None:
+                    if switch_info == 1:
+                        if alias_trg == 1:
+                            FAB_Flogi_DB_File.write(switch_name + s + sw_port + s + vsan + s + fcid + s + pwwn + s + dev_alias + "\n")
+                        else:
+                            FAB_Flogi_DB_File.write(switch_name + s + sw_port + s + vsan + s + fcid + s + pwwn + s + "Not_Defined" + "\n")
+                    else:
+                        if fab_start == 1:
+                            sw_port = Get_MDS_Mod_Int_From_WWN(switch_pwwn)
+                            switch_name = Get_MDS_SwitchName_From_WWN(switch_pwwn[-17:], List )
+                            if alias_trg == 1:
+                                FAB_Flogi_DB_File.write(switch_name + s + sw_port + s + vsan + s + fcid + s + pwwn + s + dev_alias + "\n")
+                            else:
+                                FAB_Flogi_DB_File.write(switch_name + s + sw_port + s + vsan + s + fcid + s + pwwn + s + "Not_Defined" + "\n")
+                    alias_trg = 0
+                    switch_info = 0
+                    fab_start = 1
+                    vsan, fcid = line.split()
+                    vsan = vsan.replace("VSAN:", "")
+                    fcid = fcid.replace("FCID:", "")
+
+                if re.match("^port-wwn", line) is not None:
+                    rec_list = line.split()
+                    if len(rec_list) == 3:
+                        pwwn = rec_list[2]
+                        pwwn = re.sub("^:", "", pwwn)
+                    elif len(rec_list) == 4:
+                        pwwn = rec_list[2]
+                        pwwn = re.sub("^:", "", pwwn)
+                        
+                if re.match("^            ", line) is not None:
+                    j1, dev_alias = line.split("[")
+                    dev_alias = re.sub("]$", "", dev_alias)
+                    alias_trg = 1
+
+                if re.match("^fabric-port-wwn", line) is not None:
+                    j1, switch_pwwn = line.split()
+                    switch_pwwn = re.sub("^:", "", switch_pwwn)
+                            
+                if re.match("^connected interface", line) is not None:
+                    j1, sw_port = line.split(":")
+                    sw_port = re.sub("^:", "", sw_port)
+                    sw_port = re.sub("port-channel ", "pc", sw_port)
+                    sw_port = re.sub("Virtual Device", "VirtualDevice", sw_port)
+        
+                if re.match("^switch name", line) is not None:
+                    j1, t_switch_name = line.split(":")
+                    sw_str_len = len(t_switch_name.split())
+                    if re.match("Not Available",t_switch_name) is not None:
+                       switch_name = "Unknown_Switch"
+                    elif sw_str_len == 2:
+                       switch_name, j2 = t_switch_name.split()
+                    else:
+                       switch_name = t_switch_name.replace(" ", "")
+                    switch_info = 1
+
+    FAB_Flogi_DB_File.close()
+    return(0)
+
+    
+################################################################################################
+# Converting WWPN to big format by adding :
+################################################################################################
+def Convert_WWPN_Big(wwpn):
+    if len(wwpn) != 16:
+        print "Error WWPN: " + wwpn + " is not 16 charater long."
+        sys.exit(20)
+
+    # Check if wwpn has all hex characters
+    for char in wwpn:
+        regexp = re.compile(r'[0-9a-fA-F]')
+        if regexp.search(char) is None:
+            print "Error WWPN: " + wwpn + " has non hex characters."
+            sys.exit(20)
+    
+    a = -2
+    b = -16
+    chk = 0
+    while chk == 0:
+        a = a + 2
+        b = b + 2
+        if b == 0:
+            b_wwpn = b_wwpn + ":" + wwpn[a:]
+        else:
+            if a == 0:
+                b_wwpn = wwpn[a:b] 
+            else:
+                b_wwpn = b_wwpn + ":" + wwpn[a:b]
+        if a == 14 and b == 0:
+            chk = 1
+
+    return(b_wwpn)
+
+
+################################################################################################
+# Searching for any alias or string in flogi database.
+################################################################################################
+def Search_For_Alias(search_str):
+    fab_flogi_db_file = CACHE_DIR + "/fab_flogi_devalias_info.txt"
+    with open(fab_flogi_db_file, 'r') as FCNS_DB_File:
+        content = FCNS_DB_File.read()
+        search_chk = 0
+        for line in StringIO.StringIO(content):
+            line = line.replace('\r',"")
+            line = line.replace("\n","")
+            if re.search(search_str, line, re.I) is not None:
+                print line
+                search_chk = 1
+        if search_chk == 0:
+            sys.exit(1)
+        else:
+            sys.exit(0)
+        
+
+################################################################################################
+# Searching for any WWPN in flogi database.
+################################################################################################
+def Search_For_WWN(search_str):
+    fab_flogi_db_file = CACHE_DIR + "/fab_flogi_devalias_info.txt"
+    with open(fab_flogi_db_file, 'r') as FCNS_DB_File:
+        content = FCNS_DB_File.read()
+        search_chk = 0
+        for line in StringIO.StringIO(content):
+            line = line.replace('\r',"")
+            line = line.replace("\n","")
+            if re.search(search_str, line, re.I) is not None:
+                print line
+                search_chk = 1
+        if search_chk == 0:
+            sys.exit(1)
+        else:
+            sys.exit(0)
+        
+
+################################################################################################
+# Searching for switch port in flogi database
+################################################################################################
+def Search_For_SwitchPort(search_sw, search_port):
+    search_sw = search_sw + " " + search_port + " "
+    fab_flogi_db_file = CACHE_DIR + "/fab_flogi_devalias_info.txt"
+    with open(fab_flogi_db_file, 'r') as FCNS_DB_File:
+        content = FCNS_DB_File.read()
+        search_chk = 0
+        for line in StringIO.StringIO(content):
+            line = line.replace('\r',"")
+            line = line.replace("\n","")
+#            if re.search(search_sw, line, re.I) is not None:
+            if re.match(search_sw, line, re.I) is not None:
+                print line
+                search_chk = 1
+        if search_chk == 0:
+            sys.exit(1)
+        else:
+            sys.exit(0)
+        
+
+################################################################################################
+# Searching for zoneset information for perticular VSAN.
+################################################################################################
+def Search_For_Zoneset(search_sw, search_vsan):
+    search_vsan = " vsan " + search_vsan + "$"
+    zoneset_file = CACHE_DIR + "/" + search_sw + "_zoneset.txt"
+    if os.path.isfile(zoneset_file) == False:
+        print "Error: " + search_sw + " zoneset File does not exists. Please check your CLI."
+        sys.exit(30)
+    with open(zoneset_file, 'r') as Zoneset_File:
+        content = Zoneset_File.read()
+        search_chk = 0
+        for line in StringIO.StringIO(content):
+            line = line.replace('\r',"")
+            line = line.replace("\n","")
+            if re.match("zoneset name " , line) is not None:
+                if re.search(search_vsan, line, re.I) is not None:
+                    print line
+                    search_chk = 1
+        if search_chk == 0:
+            sys.exit(1)
+        else:
+            sys.exit(0)
+        
+
+################################################################################################
+# Searching for zones for given search string.
+################################################################################################
+def Search_For_Zone(Switch_List, search_str):
+    search_chk = 0
+    Zone_Search_List = []
+    for switch in Switch_List:
+        zoneset_file = CACHE_DIR + "/" + switch + "_zoneset.txt"
+        if os.path.isfile(zoneset_file) == False:
+            print "Error: " + switch + " zoneset File does not exists. Please run -update_cache option."
+            sys.exit(40)
+        with open(zoneset_file, 'r') as Zoneset_File:
+            content = Zoneset_File.read()
+            temp_zone_search = []
+            for line in StringIO.StringIO(content):
+                if re.search(" zone name ", line) is not None:
+                    line = line.replace('\r',"")
+                    line = line.replace("\n","")
+                    if len(temp_zone_search) != 0:
+                        zone_check = 0
+                        temp_zone_search_set = set(temp_zone_search)
+                        for rec in temp_zone_search_set:
+                            if re.search(search_str, rec, re.I) is not None:
+                                zone_check = 1
+                        if zone_check == 1:
+                            temp_rec = temp_zone_search[0]
+                            temp_rec = switch + " " + temp_rec
+                            temp_zone_search[0] = temp_rec
+                            Zone_Search_List.append(temp_zone_search)
+                    temp_zone_search = []
+#                    temp_zone_search.append(switch + " " + line)
+                    temp_zone_search.append(line)
+                elif re.search("pwwn ", line) is not None:
+                    line = line.replace('\r',"")
+                    line = line.replace("\n","")
+                    temp_zone_search.append(line)
+
+    if len(Zone_Search_List) == 0:
+        sys.exit(1)
+    else:
+        for rec in Zone_Search_List:
+            for child_rec in rec:
+                print child_rec
+
+                               
+
+################################################################################################
+# Defining Global Variable
+################################################################################################
+global BASE_DIR
+global CFG_DIR
+global CACHE_DIR
+global Lock_File
+global CFG_File
+
+################################################################################################
+# Main
+################################################################################################
+Check_CLI_Syntax()
+
+
+#BASE_DIR = os.path.dirname(sys.argv[0])
+BASE_DIR = os.path.realpath(sys.argv[0])
+BASE_DIR, j = BASE_DIR.rsplit("/",1)
+CFG_DIR = BASE_DIR + "/etc"
+CACHE_DIR = BASE_DIR + "/cache"
+Lock_File = CFG_DIR + "/fabview.lock"
+CFG_File = CFG_DIR + "/fabview.cfg"
+
+if not os.path.isdir(CFG_DIR):
+    print "CFG_DIR: etc does not exists!"
+    print "CFG_DIR: " + CFG_DIR + " does not exists!"
+    sys.exit(3)
+
+if not os.path.isdir(CACHE_DIR):
+    print "CACHE_DIR: " + CACHE_DIR + " does not exists!"
+    sys.exit(3)
+
+if os.path.isfile(Lock_File):
+    print "Info: " + sys.argv[0] + " -update_cache is running."
+    sys.exit(4)
+
+if not os.path.isfile(CFG_File):
+    print "CFG_File: " + CFG_File + " does not exists!"
+    sys.exit(3)
+
+# Importing Config File.
+SWITCHES,SW_USER,SW_PASSWORD = Import_Config_File()
+
+if UPDATE_CACHE:
+    file = open(Lock_File, 'w+')
+    Update_Cache(SWITCHES,SW_USER,SW_PASSWORD)
+    os.remove(Lock_File)
+    sys.exit(0)
+
+if ALIAS:
+    Search_For_Alias(Alias_Search)
+
+if WWN:
+    if len(WWN_Search) == 16:
+        wwpn = Convert_WWPN_Big(WWN_Search)
+        Search_For_WWN(wwpn)
+    elif len(WWN_Search) == 23:
+        temp_wwpn = WWN_Search.replace(":", "")
+        for char in temp_wwpn:
+            regexp = re.compile(r'[0-9a-fA-F]')
+            if regexp.search(char) is None:
+                print "Error WWPN: " + WWN_Search + " has non hex characters."
+                sys.exit(20)
+        Search_For_WWN(WWN_Search)
+    else:
+        print "Error: " + WWN_Search + " is not accurate. Please provide right WWPN."
+        sys.exit(1)
+        
+if SWITCH_PORT:
+    Search_For_SwitchPort(Switch_Name, Port_Info)
+
+if ZONESET_INFO:
+    Search_For_Zoneset(SwitchName, VSANNumber)
+
+if ZONE:
+#    print SWITCHES
+    Search_For_Zone(SWITCHES, Zone_Search)
